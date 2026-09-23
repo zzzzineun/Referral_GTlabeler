@@ -1,16 +1,43 @@
 -- =============================================================================
--- GT Review Labeler - Supabase Schema
+-- GT Review Labeler v2 - Multi-reviewer Schema
 -- =============================================================================
--- Supabase 프로젝트 대시보드 → SQL Editor 에서 이 파일 전체를 한 번 실행하세요.
--- 이미 실행한 뒤에도 안전하게 재실행 가능 (idempotent).
+-- 시나리오 A: 각 리뷰어가 모든 샘플을 독립적으로 (blind) 라벨링.
+-- 새 리뷰어 자동 가입 + 새 리뷰어 등장 시 모든 샘플 자동 배정.
+--
+-- 실행 방법: Supabase 대시보드 → SQL Editor → New query → 전체 붙여넣고 Run.
+--
+-- ⚠ 주의: 기존 labeling 데이터는 모두 삭제됩니다.
+--   (reviewers 테이블은 유지되어 로그인 정보는 남습니다)
+--   라벨링을 아직 시작하지 않았다면 안전합니다.
+--   라벨링을 이미 시작했다면 실행 전 백업하세요.
 -- =============================================================================
 
 
 -- =============================================================================
--- 1) reviewers: 로그인 허용된 이메일 whitelist + admin 플래그
+-- 0) 정리 (idempotent — 여러 번 실행해도 안전)
 -- =============================================================================
--- 로그인 흐름: 유저가 이메일 입력 → 이 테이블에 있으면 매직링크 전송, 없으면 거부
--- admin=true 인 사람만 /admin 페이지 접근 가능
+drop view if exists reviewer_progress cascade;
+drop trigger if exists on_sample_created on samples cascade;
+drop trigger if exists on_reviewer_created on reviewers cascade;
+drop trigger if exists on_auth_user_created on auth.users cascade;
+drop trigger if exists samples_touch_updated_at on samples cascade;
+drop trigger if exists assignments_touch_updated_at on assignments cascade;
+drop function if exists assign_all_samples_to_new_reviewer() cascade;
+drop function if exists assign_new_sample_to_all_reviewers() cascade;
+drop function if exists handle_new_auth_user() cascade;
+drop function if exists current_reviewer_id() cascade;
+drop function if exists current_reviewer_is_admin() cascade;
+drop function if exists touch_updated_at() cascade;
+
+drop table if exists edit_logs cascade;
+drop table if exists assignments cascade;
+drop table if exists samples cascade;
+-- reviewers 는 남겨둠 (기존 admin 계정 보존)
+
+
+-- =============================================================================
+-- 1) reviewers (기존과 동일 — 이미 있으면 skip)
+-- =============================================================================
 create table if not exists reviewers (
   id uuid primary key default gen_random_uuid(),
   email text unique not null,
@@ -19,70 +46,70 @@ create table if not exists reviewers (
   created_at timestamptz not null default now()
 );
 
-comment on table reviewers is 'Whitelist of allowed emails. Only these emails can log in.';
-
 
 -- =============================================================================
--- 2) samples: 라벨링 대상 데이터. 기존 tkinter 버전의 CSV 컬럼을 그대로 반영.
+-- 2) samples (원본 데이터, immutable)
 -- =============================================================================
-create table if not exists samples (
+create table samples (
   id bigserial primary key,
-
-  -- CSV 원본 컬럼 (변경 불가, 감사용)
   row_index text,
-  patient_id text,                   -- CSV의 "연구별 환자 ID"
-  author text,                       -- CSV의 "작성의"
-  oph_record text not null,          -- 원본 OPH record (수정 안 됨)
-  gt text not null,                  -- LLM이 만든 GT 초안 (수정 안 됨)
-
-  -- 자유 형식 메타컬럼 (CSV에 있던 나머지 컬럼들을 이 JSONB에 통째로 저장)
+  patient_id text,
+  author text,
+  oph_record text not null,
+  gt text not null,
   extra jsonb not null default '{}'::jsonb,
-
-  -- 편집 결과
-  oph_revised text,                  -- 편집한 OPH. null 이면 원본 그대로 사용
-  oph_edited boolean not null default false,
-  gt_revised text,                   -- 편집한 GT
-  gt_edited boolean not null default false,
-
-  -- 리뷰어별 메모 (샘플마다 별도)
-  reviewer_note text,
-
-  -- 진행 상태
-  review_saved boolean not null default false,
-  review_excluded boolean not null default false,
-  review_saved_at timestamptz,
-  review_excluded_at timestamptz,
-
-  -- 담당 배정
-  assigned_to uuid references reviewers(id) on delete set null,
-
-  -- 낙관적 잠금 (동시 편집 감지용)
-  updated_at timestamptz not null default now(),
-  updated_by uuid references reviewers(id) on delete set null
+  created_at timestamptz not null default now()
 );
 
-create index if not exists samples_assigned_to_idx on samples(assigned_to);
-create index if not exists samples_review_saved_idx on samples(review_saved);
-
 
 -- =============================================================================
--- 3) edit_logs: audit trail - 편집 이력 (before/after 모두 보존)
+-- 3) assignments (per-reviewer 라벨링 데이터)
 -- =============================================================================
-create table if not exists edit_logs (
+-- 각 (sample, reviewer) 쌍마다 하나의 행. N명 × 100 sample = N × 100 assignments.
+create table assignments (
   id bigserial primary key,
   sample_id bigint not null references samples(id) on delete cascade,
-  reviewer_id uuid references reviewers(id) on delete set null,
-  column_name text not null,       -- 'oph_record' | 'gt' | 'reviewer_note'
+  reviewer_id uuid not null references reviewers(id) on delete cascade,
+
+  oph_revised text,
+  oph_edited boolean not null default false,
+  gt_revised text,
+  gt_edited boolean not null default false,
+  reviewer_note text,
+
+  review_saved boolean not null default false,
+  review_saved_at timestamptz,
+  review_excluded boolean not null default false,
+  review_excluded_at timestamptz,
+
+  updated_at timestamptz not null default now(),
+
+  unique (sample_id, reviewer_id)
+);
+
+create index assignments_reviewer_id_idx on assignments(reviewer_id);
+create index assignments_sample_id_idx on assignments(sample_id);
+
+
+-- =============================================================================
+-- 4) edit_logs (assignment 단위로 audit)
+-- =============================================================================
+create table edit_logs (
+  id bigserial primary key,
+  assignment_id bigint not null references assignments(id) on delete cascade,
+  reviewer_id uuid not null references reviewers(id) on delete cascade,
+  column_name text not null,
   before_text text,
   after_text text,
   edited_at timestamptz not null default now()
 );
 
-create index if not exists edit_logs_sample_id_idx on edit_logs(sample_id);
+create index edit_logs_assignment_id_idx on edit_logs(assignment_id);
+create index edit_logs_reviewer_id_idx on edit_logs(reviewer_id);
 
 
 -- =============================================================================
--- 4) 자동 updated_at 갱신 트리거
+-- 5) touch_updated_at trigger
 -- =============================================================================
 create or replace function touch_updated_at()
 returns trigger language plpgsql as $$
@@ -92,28 +119,73 @@ begin
 end;
 $$;
 
-drop trigger if exists samples_touch_updated_at on samples;
-create trigger samples_touch_updated_at
-  before update on samples
+create trigger assignments_touch_updated_at
+  before update on assignments
   for each row execute function touch_updated_at();
 
 
 -- =============================================================================
--- 5) Row Level Security (RLS)
+-- 6) Auto-registration: 첫 로그인 시 reviewers에 자동 등록
 -- =============================================================================
--- 원칙:
---   - 리뷰어는 본인에게 배정된 (assigned_to = 자기 자신) sample 만 볼 수 있음
---   - admin 은 전부 볼 수 있음
---   - reviewers 테이블은 admin 만 쓸 수 있음 (읽기는 로그인한 사람 모두)
---   - edit_logs 는 서버(service role) 만 씀; 리뷰어는 읽기 X (audit용)
--- =============================================================================
+create or replace function handle_new_auth_user()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  insert into public.reviewers (email, is_admin)
+  values (new.email, false)
+  on conflict (email) do nothing;
+  return new;
+end;
+$$;
 
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function handle_new_auth_user();
+
+
+-- =============================================================================
+-- 7) Auto-assign: 새 리뷰어 → 기존 모든 샘플 assignment 생성
+-- =============================================================================
+create or replace function assign_all_samples_to_new_reviewer()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  insert into public.assignments (sample_id, reviewer_id)
+  select s.id, new.id from public.samples s
+  on conflict (sample_id, reviewer_id) do nothing;
+  return new;
+end;
+$$;
+
+create trigger on_reviewer_created
+  after insert on reviewers
+  for each row execute function assign_all_samples_to_new_reviewer();
+
+
+-- =============================================================================
+-- 8) Auto-assign: 새 sample → 기존 모든 리뷰어 assignment 생성
+-- =============================================================================
+create or replace function assign_new_sample_to_all_reviewers()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  insert into public.assignments (sample_id, reviewer_id)
+  select new.id, r.id from public.reviewers r
+  on conflict (sample_id, reviewer_id) do nothing;
+  return new;
+end;
+$$;
+
+create trigger on_sample_created
+  after insert on samples
+  for each row execute function assign_new_sample_to_all_reviewers();
+
+
+-- =============================================================================
+-- 9) RLS
+-- =============================================================================
 alter table reviewers enable row level security;
 alter table samples enable row level security;
+alter table assignments enable row level security;
 alter table edit_logs enable row level security;
 
-
--- 현재 auth 유저의 reviewer 레코드를 반환하는 헬퍼
 create or replace function current_reviewer_id()
 returns uuid language sql stable as $$
   select id from reviewers where email = (auth.jwt() ->> 'email')
@@ -127,102 +199,57 @@ returns boolean language sql stable as $$
   )
 $$;
 
-
--- reviewers 정책
-drop policy if exists "reviewers read all" on reviewers;
+-- reviewers
 create policy "reviewers read all"
-  on reviewers for select
-  to authenticated
-  using (true);
-
-drop policy if exists "reviewers write admin only" on reviewers;
+  on reviewers for select to authenticated using (true);
 create policy "reviewers write admin only"
-  on reviewers for all
-  to authenticated
+  on reviewers for all to authenticated
   using (current_reviewer_is_admin())
   with check (current_reviewer_is_admin());
 
-
--- samples 정책
-drop policy if exists "samples read own or admin" on samples;
-create policy "samples read own or admin"
-  on samples for select
-  to authenticated
-  using (
-    current_reviewer_is_admin()
-    or assigned_to = current_reviewer_id()
-  );
-
-drop policy if exists "samples update own or admin" on samples;
-create policy "samples update own or admin"
-  on samples for update
-  to authenticated
-  using (
-    current_reviewer_is_admin()
-    or assigned_to = current_reviewer_id()
-  )
-  with check (
-    current_reviewer_is_admin()
-    or assigned_to = current_reviewer_id()
-  );
-
-drop policy if exists "samples insert admin only" on samples;
+-- samples (원본 데이터라 blind 무관; 모두 조회 가능. 쓰기는 admin만)
+create policy "samples read all"
+  on samples for select to authenticated using (true);
 create policy "samples insert admin only"
-  on samples for insert
-  to authenticated
-  with check (current_reviewer_is_admin());
-
-drop policy if exists "samples delete admin only" on samples;
+  on samples for insert to authenticated with check (current_reviewer_is_admin());
 create policy "samples delete admin only"
-  on samples for delete
-  to authenticated
-  using (current_reviewer_is_admin());
+  on samples for delete to authenticated using (current_reviewer_is_admin());
 
+-- assignments (본인 것만; admin은 통계용 all read)
+create policy "assignments read own or admin"
+  on assignments for select to authenticated
+  using (reviewer_id = current_reviewer_id() or current_reviewer_is_admin());
+create policy "assignments update own"
+  on assignments for update to authenticated
+  using (reviewer_id = current_reviewer_id())
+  with check (reviewer_id = current_reviewer_id());
 
--- edit_logs 정책: 리뷰어는 자기 로그만 볼 수 있음; 삽입은 서비스 롤 또는 자기 자신만
-drop policy if exists "edit_logs read own or admin" on edit_logs;
+-- edit_logs
 create policy "edit_logs read own or admin"
-  on edit_logs for select
-  to authenticated
-  using (
-    current_reviewer_is_admin()
-    or reviewer_id = current_reviewer_id()
-  );
-
-drop policy if exists "edit_logs insert own" on edit_logs;
+  on edit_logs for select to authenticated
+  using (reviewer_id = current_reviewer_id() or current_reviewer_is_admin());
 create policy "edit_logs insert own"
-  on edit_logs for insert
-  to authenticated
+  on edit_logs for insert to authenticated
   with check (reviewer_id = current_reviewer_id());
 
 
 -- =============================================================================
--- 6) 진행 통계 뷰 (admin 페이지에서 사용)
+-- 10) 통계 뷰
 -- =============================================================================
 create or replace view reviewer_progress as
 select
   r.id as reviewer_id,
   r.email,
   r.display_name,
-  count(s.id) as total_assigned,
-  count(s.id) filter (where s.review_saved) as done,
-  count(s.id) filter (where s.review_saved and not s.review_excluded) as valid,
-  count(s.id) filter (where s.review_excluded) as excluded,
-  count(s.id) filter (where s.gt_edited) as gt_edited_count,
-  count(s.id) filter (where s.oph_edited) as oph_edited_count,
-  max(s.updated_at) as last_activity_at
+  r.is_admin,
+  count(a.id) as total_assigned,
+  count(a.id) filter (where a.review_saved) as done,
+  count(a.id) filter (where a.review_saved and not a.review_excluded) as valid,
+  count(a.id) filter (where a.review_excluded) as excluded,
+  count(a.id) filter (where a.gt_edited) as gt_edited_count,
+  count(a.id) filter (where a.oph_edited) as oph_edited_count,
+  max(a.updated_at) as last_activity_at
 from reviewers r
-left join samples s on s.assigned_to = r.id
-group by r.id, r.email, r.display_name
+left join assignments a on a.reviewer_id = r.id
+group by r.id, r.email, r.display_name, r.is_admin
 order by r.email;
-
-
--- =============================================================================
--- 7) 초기 admin 계정 등록
--- =============================================================================
--- 아래 이메일을 본인 이메일로 바꾸고 실행하세요. 이 계정으로 로그인해서
--- /admin 페이지에서 다른 리뷰어를 등록하거나 CSV를 임포트할 수 있습니다.
---
--- insert into reviewers (email, display_name, is_admin) values
---   ('YOUR_EMAIL@example.com', 'Admin', true)
--- on conflict (email) do update set is_admin = true;

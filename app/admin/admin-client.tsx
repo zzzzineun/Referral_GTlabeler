@@ -11,10 +11,7 @@ type Props = {
   currentUserEmail: string;
 };
 
-// CSV 임포트 시 이 컬럼들이 있으면 top-level로 승격됨.
-// 나머지는 전부 sample.extra JSONB로 저장됨.
 const REQUIRED_CSV_COLS = ["oph_record", "gt"];
-const OPTIONAL_TOP_COLS = ["row_index", "연구별 환자 ID", "작성의"];
 
 export default function AdminClient({
   reviewers: initialReviewers,
@@ -68,16 +65,14 @@ export default function AdminClient({
             supabase={supabase}
           />
         )}
-        {tab === "import" && (
-          <ImportTab reviewers={reviewers} supabase={supabase} />
-        )}
+        {tab === "import" && <ImportTab supabase={supabase} />}
       </div>
     </div>
   );
 }
 
 // ==========================================================================
-// 진행 통계 탭
+// 진행 통계 탭 (리뷰어별)
 // ==========================================================================
 function ProgressTab({ progress }: { progress: ReviewerProgress[] }) {
   const totals = progress.reduce(
@@ -94,15 +89,19 @@ function ProgressTab({ progress }: { progress: ReviewerProgress[] }) {
     <div className="bg-white rounded-lg shadow p-6">
       <h2 className="text-lg font-semibold mb-3">리뷰어별 진행 상황</h2>
       <div className="mb-4 text-sm text-gray-600">
-        전체: <strong>{totals.total}</strong> · 완료{" "}
+        전체 (합계): <strong>{totals.total}</strong> · 완료{" "}
         <strong>{totals.done}</strong> · 유효 <strong>{totals.valid}</strong> ·
         제외 <strong>{totals.excluded}</strong>
+        <div className="text-xs text-gray-500 mt-1">
+          각 리뷰어가 모든 샘플을 독립적으로 라벨링합니다. 리뷰어 N명 × 샘플
+          M개 = N×M assignments.
+        </div>
       </div>
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-gray-200">
             <th className="text-left py-2 px-2">리뷰어</th>
-            <th className="text-right py-2 px-2">배정</th>
+            <th className="text-right py-2 px-2">총 샘플</th>
             <th className="text-right py-2 px-2">완료</th>
             <th className="text-right py-2 px-2">유효</th>
             <th className="text-right py-2 px-2">제외</th>
@@ -121,7 +120,14 @@ function ProgressTab({ progress }: { progress: ReviewerProgress[] }) {
             return (
               <tr key={p.reviewer_id} className="border-b border-gray-100">
                 <td className="py-2 px-2">
-                  <div>{p.display_name || "—"}</div>
+                  <div>
+                    {p.display_name || "—"}
+                    {p.is_admin && (
+                      <span className="ml-1 text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded">
+                        admin
+                      </span>
+                    )}
+                  </div>
                   <div className="text-xs text-gray-500">{p.email}</div>
                 </td>
                 <td className="text-right py-2 px-2">{p.total_assigned}</td>
@@ -193,13 +199,15 @@ function ReviewersTab({
     if (error) {
       setMsg(`실패: ${error.message}`);
     } else {
-      onChange([...reviewers, data as Reviewer].sort((a, b) =>
-        a.email.localeCompare(b.email),
-      ));
+      onChange(
+        [...reviewers, data as Reviewer].sort((a, b) =>
+          a.email.localeCompare(b.email),
+        ),
+      );
       setEmail("");
       setName("");
       setIsAdmin(false);
-      setMsg("등록 완료");
+      setMsg("등록 완료 (기존 모든 샘플이 자동 배정됨)");
     }
   }
 
@@ -220,7 +228,11 @@ function ReviewersTab({
   }
 
   async function removeReviewer(r: Reviewer) {
-    if (!confirm(`${r.email} 을 삭제할까요?\n(배정된 샘플은 남으며 담당자만 해제됩니다)`))
+    if (
+      !confirm(
+        `${r.email} 을 삭제할까요?\n(이 리뷰어의 모든 assignment와 편집 기록도 함께 삭제됩니다)`,
+      )
+    )
       return;
     const { error } = await supabase.from("reviewers").delete().eq("id", r.id);
     if (error) {
@@ -233,7 +245,11 @@ function ReviewersTab({
   return (
     <div className="space-y-4">
       <div className="bg-white rounded-lg shadow p-6">
-        <h2 className="text-lg font-semibold mb-3">새 리뷰어 등록</h2>
+        <h2 className="text-lg font-semibold mb-3">리뷰어 등록</h2>
+        <p className="text-xs text-gray-500 mb-3">
+          여기서 미리 등록하거나, 사용자가 이메일로 직접 로그인하면 자동으로
+          등록됩니다. 등록되는 즉시 기존 모든 샘플이 자동 배정됩니다.
+        </p>
         <form onSubmit={addReviewer} className="flex flex-wrap gap-2 items-end">
           <div className="flex-1 min-w-[200px]">
             <label className="block text-xs text-gray-600 mb-1">이메일 *</label>
@@ -333,24 +349,20 @@ function ReviewersTab({
 }
 
 // ==========================================================================
-// CSV 임포트 탭
+// CSV 임포트 탭 — 배정 방식 없음. 임포트하면 모든 리뷰어에게 자동 배정.
 // ==========================================================================
 
 type ParsedRow = Record<string, string>;
 
 function ImportTab({
-  reviewers,
   supabase,
 }: {
-  reviewers: Reviewer[];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   supabase: any;
 }) {
   const [parsed, setParsed] = useState<ParsedRow[]>([]);
   const [columns, setColumns] = useState<string[]>([]);
   const [status, setStatus] = useState<string>("");
-  const [assignMode, setAssignMode] = useState<"none" | "round_robin">("none");
-  const [selectedReviewers, setSelectedReviewers] = useState<string[]>([]);
 
   function onFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -372,9 +384,7 @@ function ImportTab({
         }
         setColumns(cols);
         setParsed(result.data);
-        setStatus(
-          `파싱 완료: ${result.data.length} 행, ${cols.length} 컬럼`,
-        );
+        setStatus(`파싱 완료: ${result.data.length} 행, ${cols.length} 컬럼`);
       },
       error: (err) => {
         setStatus(`파싱 오류: ${err.message}`);
@@ -386,30 +396,29 @@ function ImportTab({
     if (parsed.length === 0) return;
     if (
       !confirm(
-        `${parsed.length} 개 샘플을 임포트합니다. 계속할까요?\n\n(주의: 기존 samples 는 지워지지 않고 추가됩니다. 완전 재임포트는 SQL에서 DELETE 후 실행하세요.)`,
+        `${parsed.length} 개 샘플을 임포트합니다. 계속할까요?\n\n` +
+          `임포트되면 등록된 모든 리뷰어에게 각 샘플이 자동 배정됩니다.\n` +
+          `(기존 samples 는 지워지지 않고 추가됩니다. 완전 재임포트는 SQL에서 DELETE 후 실행)`,
       )
     )
       return;
 
     setStatus("업로드 중...");
 
-    // 배정 계산
-    const chosen = reviewers.filter((r) => selectedReviewers.includes(r.id));
-    const getAssignee = (idx: number): string | null => {
-      if (assignMode === "none" || chosen.length === 0) return null;
-      return chosen[idx % chosen.length].id;
-    };
-
-    // top-level 컬럼 vs extra 컬럼 분리
+    // top-level 컬럼 vs extra
     const rows = parsed.map((row, idx) => {
       const extra: Record<string, string> = {};
       const topLevel: Partial<Record<string, string | null>> = {};
 
       for (const [key, value] of Object.entries(row)) {
-        if (key === "oph_record" || key === "gt") continue; // 아래서 처리
-        if (key === "row_index") topLevel.row_index = value || null;
-        else if (key === "연구별 환자 ID") topLevel.patient_id = value || null;
-        else if (key === "작성의") topLevel.author = value || null;
+        if (key === "oph_record" || key === "gt") continue;
+        // row_index / index 둘 다 인식
+        if (key === "row_index" || key === "index")
+          topLevel.row_index = value || null;
+        else if (key === "연구별 환자 ID" || key === "patient_id")
+          topLevel.patient_id = value || null;
+        else if (key === "작성의" || key === "author")
+          topLevel.author = value || null;
         else extra[key] = value ?? "";
       }
 
@@ -420,12 +429,10 @@ function ImportTab({
         oph_record: row.oph_record ?? "",
         gt: row.gt ?? "",
         extra,
-        assigned_to: getAssignee(idx),
       };
     });
 
-    // 500개씩 청크로 나눠 삽입
-    const chunkSize = 500;
+    const chunkSize = 200; // 트리거가 무거우니 청크 크기 작게
     let inserted = 0;
     for (let i = 0; i < rows.length; i += chunkSize) {
       const chunk = rows.slice(i, i + chunkSize);
@@ -435,18 +442,14 @@ function ImportTab({
         return;
       }
       inserted += chunk.length;
-      setStatus(`${inserted}/${rows.length} 삽입 중...`);
+      setStatus(`${inserted}/${rows.length} 삽입 중... (리뷰어에게 자동 배정)`);
     }
 
-    setStatus(`완료! ${inserted}개 샘플 임포트됨.`);
+    setStatus(
+      `완료! ${inserted}개 샘플 임포트됨. 모든 리뷰어에게 자동 배정 완료.`,
+    );
     setParsed([]);
     setColumns([]);
-  }
-
-  function toggleReviewer(id: string) {
-    setSelectedReviewers((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
-    );
   }
 
   return (
@@ -456,11 +459,19 @@ function ImportTab({
         <p className="text-sm text-gray-600 mb-3">
           필수 컬럼: <code className="bg-gray-100 px-1">oph_record</code>,{" "}
           <code className="bg-gray-100 px-1">gt</code>. 그 외 컬럼(
-          <code className="bg-gray-100 px-1">row_index</code>,{" "}
+          <code className="bg-gray-100 px-1">row_index</code>/
+          <code className="bg-gray-100 px-1">index</code>,{" "}
+          <code className="bg-gray-100 px-1">patient_id</code>/
           <code className="bg-gray-100 px-1">연구별 환자 ID</code>,{" "}
-          <code className="bg-gray-100 px-1">작성의</code> 등)은 자동 인식되며,
-          나머지는 <code className="bg-gray-100 px-1">extra</code> JSONB에 저장됩니다.
+          <code className="bg-gray-100 px-1">author</code>/
+          <code className="bg-gray-100 px-1">작성의</code>)은 자동 인식되며,
+          나머지는 <code className="bg-gray-100 px-1">extra</code> JSONB에 저장.
         </p>
+        <div className="text-xs text-blue-700 bg-blue-50 border border-blue-200 rounded p-2 mb-3">
+          💡 이 시스템은 <strong>각 리뷰어가 모든 샘플을 독립적으로</strong>{" "}
+          라벨링합니다. CSV를 임포트하면 등록된 모든 리뷰어에게 자동 배정되며,
+          이후 새로 가입하는 리뷰어에게도 자동 배정됩니다.
+        </div>
 
         <input
           type="file"
@@ -477,78 +488,14 @@ function ImportTab({
 
         {parsed.length > 0 && (
           <>
-            <div className="text-sm text-gray-600 mb-2">
+            <div className="text-sm text-gray-600 mb-3">
               감지된 컬럼: {columns.join(", ")}
             </div>
-
-            <div className="border border-gray-200 rounded p-3 mb-3 bg-gray-50">
-              <div className="text-sm font-semibold mb-2">배정 방식</div>
-              <div className="space-y-2 text-sm">
-                <label className="flex items-center gap-2">
-                  <input
-                    type="radio"
-                    checked={assignMode === "none"}
-                    onChange={() => setAssignMode("none")}
-                  />
-                  배정하지 않음 (나중에 SQL로 직접 배정)
-                </label>
-                <label className="flex items-center gap-2">
-                  <input
-                    type="radio"
-                    checked={assignMode === "round_robin"}
-                    onChange={() => setAssignMode("round_robin")}
-                  />
-                  선택된 리뷰어에게 순환 배정
-                </label>
-              </div>
-
-              {assignMode === "round_robin" && (
-                <div className="mt-3">
-                  <div className="text-xs text-gray-600 mb-1">
-                    배정할 리뷰어를 선택하세요:
-                  </div>
-                  <div className="space-y-1">
-                    {reviewers
-                      .filter((r) => !r.is_admin || true) // admin도 선택 가능
-                      .map((r) => (
-                        <label
-                          key={r.id}
-                          className="flex items-center gap-2 text-sm"
-                        >
-                          <input
-                            type="checkbox"
-                            checked={selectedReviewers.includes(r.id)}
-                            onChange={() => toggleReviewer(r.id)}
-                          />
-                          {r.email}
-                          {r.display_name && (
-                            <span className="text-gray-500">
-                              ({r.display_name})
-                            </span>
-                          )}
-                        </label>
-                      ))}
-                  </div>
-                  {selectedReviewers.length > 0 && (
-                    <div className="mt-2 text-xs text-gray-500">
-                      {parsed.length}개 샘플을 {selectedReviewers.length}명에게
-                      배정 → 각자{" "}
-                      {Math.ceil(parsed.length / selectedReviewers.length)}개
-                      전후
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-
             <button
               onClick={doImport}
-              disabled={
-                assignMode === "round_robin" && selectedReviewers.length === 0
-              }
-              className="px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:bg-gray-400"
+              className="px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700"
             >
-              {parsed.length}개 샘플 임포트
+              {parsed.length}개 샘플 임포트 (모든 리뷰어에게 자동 배정)
             </button>
           </>
         )}

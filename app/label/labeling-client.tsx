@@ -8,29 +8,33 @@ import {
   FORMAT_TEMPLATE,
   parseMarkdownBold,
 } from "@/lib/constants";
-import type { Reviewer, Sample, SampleListItem } from "@/lib/types";
+import type {
+  Assignment,
+  AssignmentListItem,
+  LoadedItem,
+  Reviewer,
+} from "@/lib/types";
 
 type Props = {
   reviewer: Reviewer;
-  initialSamples: SampleListItem[];
+  initialItems: AssignmentListItem[];
 };
 
-// 현재 편집 중인 로컬 상태 (DB에 저장되기 전 임시)
 type DraftState = {
   oph: string;
   gt: string;
   note: string;
 };
 
-export default function LabelingClient({ reviewer, initialSamples }: Props) {
+export default function LabelingClient({ reviewer, initialItems }: Props) {
   const supabase = createClient();
   const router = useRouter();
 
-  const [samples, setSamples] = useState<SampleListItem[]>(initialSamples);
+  const [items, setItems] = useState<AssignmentListItem[]>(initialItems);
   const [currentIdx, setCurrentIdx] = useState<number>(() =>
-    findFirstUnsavedIdx(initialSamples),
+    findFirstUnsavedIdx(initialItems),
   );
-  const [currentSample, setCurrentSample] = useState<Sample | null>(null);
+  const [currentItem, setCurrentItem] = useState<LoadedItem | null>(null);
   const [draft, setDraft] = useState<DraftState>({ oph: "", gt: "", note: "" });
   const [loading, setLoading] = useState(false);
   const [saveStatus, setSaveStatus] = useState<
@@ -40,85 +44,118 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
   const [guideOpen, setGuideOpen] = useState(true);
   const [noteOpen, setNoteOpen] = useState(true);
 
-  // 현재 로드된 sample.id — 저장 시 index 대신 이 값으로 안전하게 지정
-  const currentSampleIdRef = useRef<number | null>(null);
-  // draft 최신 값을 저장 함수에서 읽기 위한 ref
+  const currentAssignmentIdRef = useRef<number | null>(null);
   const draftRef = useRef<DraftState>(draft);
   useEffect(() => {
     draftRef.current = draft;
   }, [draft]);
 
-  // ---------- 샘플 로드 ----------
-  const loadSample = useCallback(
+  // ---------- 로드 ----------
+  const loadItem = useCallback(
     async (idx: number) => {
-      if (idx < 0 || idx >= samples.length) return;
-      const targetId = samples[idx].id;
+      if (idx < 0 || idx >= items.length) return;
+      const targetId = items[idx].id;
       setLoading(true);
       setSaveStatus("idle");
       setSaveError(null);
 
+      // assignment + 원본 sample 을 한번에 fetch
       const { data, error } = await supabase
-        .from("samples")
-        .select("*")
+        .from("assignments")
+        .select(
+          `
+          *,
+          samples!inner ( row_index, patient_id, author, oph_record, gt )
+          `,
+        )
         .eq("id", targetId)
-        .maybeSingle<Sample>();
+        .maybeSingle();
 
       setLoading(false);
 
       if (error || !data) {
         setSaveStatus("error");
-        setSaveError(error?.message ?? "샘플을 찾을 수 없습니다");
+        setSaveError(error?.message ?? "Assignment 를 찾을 수 없습니다");
         return;
       }
 
-      setCurrentSample(data);
-      currentSampleIdRef.current = data.id;
+      const row = data as unknown as Assignment & {
+        samples: {
+          row_index: string | null;
+          patient_id: string | null;
+          author: string | null;
+          oph_record: string;
+          gt: string;
+        };
+      };
+
+      const loaded: LoadedItem = {
+        id: row.id,
+        sample_id: row.sample_id,
+        reviewer_id: row.reviewer_id,
+        oph_revised: row.oph_revised,
+        oph_edited: row.oph_edited,
+        gt_revised: row.gt_revised,
+        gt_edited: row.gt_edited,
+        reviewer_note: row.reviewer_note,
+        review_saved: row.review_saved,
+        review_excluded: row.review_excluded,
+        review_saved_at: row.review_saved_at,
+        review_excluded_at: row.review_excluded_at,
+        updated_at: row.updated_at,
+        oph_record: row.samples.oph_record,
+        gt: row.samples.gt,
+        patient_id: row.samples.patient_id,
+        author: row.samples.author,
+        row_index: row.samples.row_index,
+      };
+
+      setCurrentItem(loaded);
+      currentAssignmentIdRef.current = loaded.id;
       setDraft({
-        oph: data.oph_revised ?? data.oph_record,
-        gt: data.gt_revised ?? data.gt,
-        note: data.reviewer_note ?? "",
+        oph: loaded.oph_revised ?? loaded.oph_record,
+        gt: loaded.gt_revised ?? loaded.gt,
+        note: loaded.reviewer_note ?? "",
       });
       setCurrentIdx(idx);
     },
-    [samples, supabase],
+    [items, supabase],
   );
 
-  // 마운트 시 첫 샘플 로드
   useEffect(() => {
-    if (samples.length > 0) {
-      loadSample(currentIdx);
+    if (items.length > 0) {
+      loadItem(currentIdx);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---------- 저장 (공통) ----------
+  // ---------- 저장 ----------
   const persist = useCallback(
     async (opts: {
       markSaved?: boolean;
       markExcluded?: boolean;
     }): Promise<{ ok: boolean; message?: string }> => {
-      const sample = currentSample;
-      const sampleId = currentSampleIdRef.current;
-      if (!sample || sampleId == null) return { ok: false, message: "no sample" };
+      const item = currentItem;
+      const assignmentId = currentAssignmentIdRef.current;
+      if (!item || assignmentId == null)
+        return { ok: false, message: "no item" };
 
       const d = draftRef.current;
       const now = new Date().toISOString();
 
-      const ophChanged = d.oph !== (sample.oph_revised ?? sample.oph_record);
-      const gtChanged = d.gt !== (sample.gt_revised ?? sample.gt);
-      const noteChanged = d.note !== (sample.reviewer_note ?? "");
+      const ophChanged = d.oph !== (item.oph_revised ?? item.oph_record);
+      const gtChanged = d.gt !== (item.gt_revised ?? item.gt);
+      const noteChanged = d.note !== (item.reviewer_note ?? "");
 
-      const patch: Partial<Sample> & { updated_by?: string } = {
-        updated_by: reviewer.id,
-      };
+      const patch: Partial<Assignment> = {};
 
       if (ophChanged) {
         patch.oph_revised = d.oph;
-        patch.oph_edited = d.oph !== sample.oph_record;
+        patch.oph_edited = d.oph !== item.oph_record;
       }
       if (gtChanged) {
         patch.gt_revised = d.gt;
-        patch.gt_edited = d.gt !== sample.gt;
+        patch.gt_edited = d.gt !== item.gt;
       }
       if (noteChanged) {
         patch.reviewer_note = d.note;
@@ -134,7 +171,6 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
         patch.review_saved_at = now;
       }
 
-      // 변경 사항이 하나도 없고 상태 마킹도 없으면 skip
       const nothingToDo =
         !ophChanged &&
         !gtChanged &&
@@ -146,9 +182,9 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
       setSaveStatus("saving");
 
       const { error: updateError } = await supabase
-        .from("samples")
+        .from("assignments")
         .update(patch)
-        .eq("id", sampleId);
+        .eq("id", assignmentId);
 
       if (updateError) {
         setSaveStatus("error");
@@ -156,9 +192,9 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
         return { ok: false, message: updateError.message };
       }
 
-      // audit log — 실제로 텍스트가 바뀐 것만 기록
+      // audit log
       const logEntries: Array<{
-        sample_id: number;
+        assignment_id: number;
         reviewer_id: string;
         column_name: string;
         before_text: string | null;
@@ -166,28 +202,28 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
       }> = [];
       if (ophChanged) {
         logEntries.push({
-          sample_id: sampleId,
+          assignment_id: assignmentId,
           reviewer_id: reviewer.id,
           column_name: "oph_record",
-          before_text: sample.oph_revised ?? sample.oph_record,
+          before_text: item.oph_revised ?? item.oph_record,
           after_text: d.oph,
         });
       }
       if (gtChanged) {
         logEntries.push({
-          sample_id: sampleId,
+          assignment_id: assignmentId,
           reviewer_id: reviewer.id,
           column_name: "gt",
-          before_text: sample.gt_revised ?? sample.gt,
+          before_text: item.gt_revised ?? item.gt,
           after_text: d.gt,
         });
       }
       if (noteChanged) {
         logEntries.push({
-          sample_id: sampleId,
+          assignment_id: assignmentId,
           reviewer_id: reviewer.id,
           column_name: "reviewer_note",
-          before_text: sample.reviewer_note ?? "",
+          before_text: item.reviewer_note ?? "",
           after_text: d.note,
         });
       }
@@ -195,10 +231,10 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
         await supabase.from("edit_logs").insert(logEntries);
       }
 
-      // 로컬 리스트도 즉시 갱신 (색상 반영)
-      setSamples((prev) =>
+      // 사이드바 갱신
+      setItems((prev) =>
         prev.map((s) =>
-          s.id === sampleId
+          s.id === assignmentId
             ? {
                 ...s,
                 review_saved: patch.review_saved ?? s.review_saved,
@@ -210,73 +246,74 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
         ),
       );
 
-      // 현재 sample 로컬 캐시도 갱신
-      setCurrentSample((prev) => (prev ? { ...prev, ...patch } as Sample : prev));
+      setCurrentItem((prev) =>
+        prev ? ({ ...prev, ...patch } as LoadedItem) : prev,
+      );
 
       setSaveStatus("saved");
       return { ok: true };
     },
-    [currentSample, reviewer.id, supabase],
+    [currentItem, reviewer.id, supabase],
   );
 
-  // ---------- 액션 버튼들 ----------
+  // ---------- 액션 ----------
   const handlePrev = useCallback(async () => {
     if (currentIdx <= 0) return;
-    await persist({ markSaved: false }); // 자동 저장 (완료 표시 없이)
-    await loadSample(currentIdx - 1);
-  }, [currentIdx, persist, loadSample]);
+    await persist({});
+    await loadItem(currentIdx - 1);
+  }, [currentIdx, persist, loadItem]);
 
   const handleNext = useCallback(async () => {
-    if (currentIdx >= samples.length - 1) return;
-    await persist({ markSaved: false }); // 자동 저장 (완료 표시 없이)
-    await loadSample(currentIdx + 1);
-  }, [currentIdx, samples.length, persist, loadSample]);
+    if (currentIdx >= items.length - 1) return;
+    await persist({});
+    await loadItem(currentIdx + 1);
+  }, [currentIdx, items.length, persist, loadItem]);
 
   const handleSave = useCallback(async () => {
     const res = await persist({ markSaved: true });
     if (res.ok) {
-      // "저장 완료" 상태를 잠깐 보여주고 다음으로 이동
       setTimeout(() => {
-        if (currentIdx < samples.length - 1) {
-          loadSample(currentIdx + 1);
+        if (currentIdx < items.length - 1) {
+          loadItem(currentIdx + 1);
         }
       }, 200);
     }
-  }, [persist, currentIdx, samples.length, loadSample]);
+  }, [persist, currentIdx, items.length, loadItem]);
 
   const handleExclude = useCallback(async () => {
     if (!confirm("이 샘플을 제외로 표시할까요?")) return;
     const res = await persist({ markExcluded: true });
-    if (res.ok && currentIdx < samples.length - 1) {
-      setTimeout(() => loadSample(currentIdx + 1), 200);
+    if (res.ok && currentIdx < items.length - 1) {
+      setTimeout(() => loadItem(currentIdx + 1), 200);
     }
-  }, [persist, currentIdx, samples.length, loadSample]);
+  }, [persist, currentIdx, items.length, loadItem]);
 
   const handleJumpToUnsaved = useCallback(async () => {
     await persist({});
-    // 현재 이후의 첫 미저장, 없으면 처음부터
     const startFrom = currentIdx + 1;
-    let target = samples.slice(startFrom).findIndex((s) => !s.review_saved);
+    let target = items.slice(startFrom).findIndex((s) => !s.review_saved);
     if (target >= 0) target += startFrom;
-    else target = samples.findIndex((s) => !s.review_saved);
+    else target = items.findIndex((s) => !s.review_saved);
     if (target >= 0) {
-      loadSample(target);
+      loadItem(target);
     } else {
       alert("모든 샘플이 저장 완료 상태입니다.");
     }
-  }, [currentIdx, samples, persist, loadSample]);
+  }, [currentIdx, items, persist, loadItem]);
 
   const handleResetOph = useCallback(() => {
-    if (!currentSample) return;
-    if (!confirm("편집한 OPH를 버리고 원본으로 되돌립니다.\n계속할까요?")) return;
-    setDraft((d) => ({ ...d, oph: currentSample.oph_record }));
-  }, [currentSample]);
+    if (!currentItem) return;
+    if (!confirm("편집한 OPH를 버리고 원본으로 되돌립니다.\n계속할까요?"))
+      return;
+    setDraft((d) => ({ ...d, oph: currentItem.oph_record }));
+  }, [currentItem]);
 
   const handleResetGt = useCallback(() => {
-    if (!currentSample) return;
-    if (!confirm("편집한 GT를 버리고 원본(초안)으로 되돌립니다.\n계속할까요?")) return;
-    setDraft((d) => ({ ...d, gt: currentSample.gt }));
-  }, [currentSample]);
+    if (!currentItem) return;
+    if (!confirm("편집한 GT를 버리고 원본(초안)으로 되돌립니다.\n계속할까요?"))
+      return;
+    setDraft((d) => ({ ...d, gt: currentItem.gt }));
+  }, [currentItem]);
 
   const handleLogout = useCallback(async () => {
     await persist({});
@@ -286,16 +323,16 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
 
   // ---------- 통계 ----------
   const stats = useMemo(() => {
-    const total = samples.length;
-    const done = samples.filter((s) => s.review_saved).length;
-    const excluded = samples.filter((s) => s.review_excluded).length;
+    const total = items.length;
+    const done = items.filter((s) => s.review_saved).length;
+    const excluded = items.filter((s) => s.review_excluded).length;
     const valid = done - excluded;
-    const edited = samples.filter((s) => s.gt_edited || s.oph_edited).length;
+    const edited = items.filter((s) => s.gt_edited || s.oph_edited).length;
     return { total, done, valid, excluded, edited };
-  }, [samples]);
+  }, [items]);
 
   // ---------- 렌더 ----------
-  if (samples.length === 0) {
+  if (items.length === 0) {
     return (
       <div className="min-h-screen flex items-center justify-center p-8">
         <div className="max-w-md text-center">
@@ -303,7 +340,8 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
           {reviewer.is_admin ? (
             <>
               <p className="text-gray-600 text-sm mb-4">
-                관리자 페이지에서 CSV를 임포트하고 리뷰어에게 배정하세요.
+                관리자 페이지에서 CSV를 임포트하세요. 임포트되면 모든
+                리뷰어에게 자동 배정됩니다.
               </p>
               <a
                 href="/admin"
@@ -323,7 +361,7 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
           ) : (
             <>
               <p className="text-gray-600 text-sm mb-4">
-                관리자에게 샘플 배정을 요청하세요.
+                아직 임포트된 샘플이 없습니다. 관리자에게 문의하세요.
               </p>
               <button
                 onClick={handleLogout}
@@ -338,11 +376,8 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
     );
   }
 
-  const currentListItem = samples[currentIdx];
-
   return (
     <div className="h-screen flex flex-col overflow-hidden">
-      {/* 상단 참고 박스 */}
       <GuideBox open={guideOpen} onToggle={() => setGuideOpen((v) => !v)} />
 
       {/* 툴바 */}
@@ -380,7 +415,7 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
           </button>
           <button
             onClick={handleNext}
-            disabled={currentIdx >= samples.length - 1 || loading}
+            disabled={currentIdx >= items.length - 1 || loading}
             className="px-3 py-1.5 border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-40"
           >
             다음 →
@@ -423,24 +458,24 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
       </div>
 
       {/* Meta */}
-      {currentSample && (
+      {currentItem && (
         <div className="px-3 py-1.5 bg-gray-50 border-b border-gray-200 text-sm text-gray-700 flex flex-wrap gap-x-6 gap-y-1">
           <span>
             <strong>Row:</strong> {currentIdx + 1}
           </span>
-          {currentSample.patient_id && (
+          {currentItem.patient_id && (
             <span>
-              <strong>환자 ID:</strong> {currentSample.patient_id}
+              <strong>환자 ID:</strong> {currentItem.patient_id}
             </span>
           )}
-          {currentSample.author && (
+          {currentItem.author && (
             <span>
-              <strong>작성의:</strong> {currentSample.author}
+              <strong>작성의:</strong> {currentItem.author}
             </span>
           )}
           <span>
             <strong>Saved:</strong>{" "}
-            {currentSample.review_saved ? (
+            {currentItem.review_saved ? (
               <span className="text-green-700">Y</span>
             ) : (
               "N"
@@ -448,7 +483,7 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
           </span>
           <span>
             <strong>OPH edited:</strong>{" "}
-            {draft.oph !== currentSample.oph_record ? (
+            {draft.oph !== currentItem.oph_record ? (
               <span className="text-amber-700">Y</span>
             ) : (
               "N"
@@ -456,7 +491,7 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
           </span>
           <span>
             <strong>GT edited:</strong>{" "}
-            {draft.gt !== currentSample.gt ? (
+            {draft.gt !== currentItem.gt ? (
               <span className="text-amber-700">Y</span>
             ) : (
               "N"
@@ -464,7 +499,7 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
           </span>
           <span>
             <strong>Excluded:</strong>{" "}
-            {currentSample.review_excluded ? (
+            {currentItem.review_excluded ? (
               <span className="text-red-700">Y</span>
             ) : (
               "N"
@@ -473,43 +508,39 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
         </div>
       )}
 
-      {/* 본문: 좌 사이드바 · 중앙 편집 · (선택) 우 메모 */}
       <div className="flex-1 flex overflow-hidden">
-        {/* 좌 사이드바 */}
         <Sidebar
-          samples={samples}
+          items={items}
           currentIdx={currentIdx}
           onSelect={async (idx) => {
             await persist({});
-            loadSample(idx);
+            loadItem(idx);
           }}
         />
 
-        {/* 편집 영역 */}
         <div className="flex-1 flex overflow-hidden">
           <EditorPanel
             title="OPH Record  (편집 가능)"
             value={draft.oph}
             onChange={(v) => setDraft((d) => ({ ...d, oph: v }))}
             onReset={handleResetOph}
-            disabled={loading || !currentSample}
+            disabled={loading || !currentItem}
           />
           <EditorPanel
             title="GT  (편집 가능)"
             value={draft.gt}
             onChange={(v) => setDraft((d) => ({ ...d, gt: v }))}
             onReset={handleResetGt}
-            disabled={loading || !currentSample}
+            disabled={loading || !currentItem}
           />
         </div>
 
-        {/* 메모장 (토글) */}
         {noteOpen && (
           <NotePanel
             value={draft.note}
             onChange={(v) => setDraft((d) => ({ ...d, note: v }))}
             onClose={() => setNoteOpen(false)}
-            disabled={loading || !currentSample}
+            disabled={loading || !currentItem}
           />
         )}
       </div>
@@ -518,11 +549,11 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
 }
 
 // =========================================================================
-// 서브 컴포넌트
+// 서브 컴포넌트 (이전과 거의 동일 — 이름만 sample → item으로 바뀜)
 // =========================================================================
 
-function findFirstUnsavedIdx(samples: SampleListItem[]): number {
-  const i = samples.findIndex((s) => !s.review_saved);
+function findFirstUnsavedIdx(items: AssignmentListItem[]): number {
+  const i = items.findIndex((s) => !s.review_saved);
   return i >= 0 ? i : 0;
 }
 
@@ -539,10 +570,7 @@ function SaveStatusIndicator({
     return <span className="text-xs text-green-600">✓ 저장됨</span>;
   if (status === "error")
     return (
-      <span
-        className="text-xs text-red-600"
-        title={error ?? undefined}
-      >
+      <span className="text-xs text-red-600" title={error ?? undefined}>
         ✗ 저장 실패
       </span>
     );
@@ -605,15 +633,14 @@ function GuideBoxPane({ title, text }: { title: string; text: string }) {
 }
 
 function Sidebar({
-  samples,
+  items,
   currentIdx,
   onSelect,
 }: {
-  samples: SampleListItem[];
+  items: AssignmentListItem[];
   currentIdx: number;
   onSelect: (idx: number) => void;
 }) {
-  // 현재 선택된 항목이 항상 뷰포트에 보이도록 스크롤
   const listRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const el = listRef.current?.querySelector<HTMLButtonElement>(
@@ -628,7 +655,7 @@ function Sidebar({
         No.
       </div>
       <div ref={listRef} className="flex-1 overflow-y-auto py-1">
-        {samples.map((s, idx) => {
+        {items.map((s, idx) => {
           const isCurrent = idx === currentIdx;
           let bg = "bg-white text-gray-900";
           if (isCurrent) bg = "bg-blue-300 text-gray-900";
