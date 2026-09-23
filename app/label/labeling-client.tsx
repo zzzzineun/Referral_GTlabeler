@@ -280,14 +280,6 @@ export default function LabelingClient({ reviewer, initialItems }: Props) {
     }
   }, [persist, currentIdx, items.length, loadItem]);
 
-  const handleExclude = useCallback(async () => {
-    if (!confirm("이 샘플을 제외로 표시할까요?")) return;
-    const res = await persist({ markExcluded: true });
-    if (res.ok && currentIdx < items.length - 1) {
-      setTimeout(() => loadItem(currentIdx + 1), 200);
-    }
-  }, [persist, currentIdx, items.length, loadItem]);
-
   const handleJumpToUnsaved = useCallback(async () => {
     await persist({});
     const startFrom = currentIdx + 1;
@@ -392,8 +384,8 @@ export default function LabelingClient({ reviewer, initialItems }: Props) {
         </span>
         <span className="text-gray-400">|</span>
         <span className="text-gray-700">
-          {currentIdx + 1} / {stats.total} · 완료 {stats.done} · 유효{" "}
-          {stats.valid} · 수정 {stats.edited} · 제외 {stats.excluded}
+          {currentIdx + 1} / {stats.total} · 완료 {stats.done} · 수정{" "}
+          {stats.edited}
         </span>
 
         <div className="ml-auto flex items-center gap-2">
@@ -426,13 +418,6 @@ export default function LabelingClient({ reviewer, initialItems }: Props) {
             className="px-3 py-1.5 border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-40"
           >
             다음 미저장
-          </button>
-          <button
-            onClick={handleExclude}
-            disabled={loading}
-            className="px-3 py-1.5 border border-red-300 text-red-700 rounded hover:bg-red-50 disabled:opacity-40"
-          >
-            제외
           </button>
           <button
             onClick={() => setNoteOpen((v) => !v)}
@@ -493,14 +478,6 @@ export default function LabelingClient({ reviewer, initialItems }: Props) {
             <strong>GT edited:</strong>{" "}
             {draft.gt !== currentItem.gt ? (
               <span className="text-amber-700">Y</span>
-            ) : (
-              "N"
-            )}
-          </span>
-          <span>
-            <strong>Excluded:</strong>{" "}
-            {currentItem.review_excluded ? (
-              <span className="text-red-700">Y</span>
             ) : (
               "N"
             )}
