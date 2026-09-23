@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body {
+  height: 100%;
+}
+
+body {
+  background: #f3f4f6;
+}
+
+/* textarea 안에서 word-wrap 을 잘 유지하도록 */
+.editor-textarea {
+  font-family: "Malgun Gothic", "맑은 고딕", system-ui, sans-serif;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
