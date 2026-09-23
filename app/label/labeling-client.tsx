@@ -300,15 +300,39 @@ export default function LabelingClient({ reviewer, initialSamples }: Props) {
       <div className="min-h-screen flex items-center justify-center p-8">
         <div className="max-w-md text-center">
           <h1 className="text-xl font-bold mb-2">배정된 샘플이 없습니다</h1>
-          <p className="text-gray-600 text-sm mb-4">
-            관리자에게 샘플 배정을 요청하세요.
-          </p>
-          <button
-            onClick={handleLogout}
-            className="text-sm text-blue-600 hover:underline"
-          >
-            로그아웃
-          </button>
+          {reviewer.is_admin ? (
+            <>
+              <p className="text-gray-600 text-sm mb-4">
+                관리자 페이지에서 CSV를 임포트하고 리뷰어에게 배정하세요.
+              </p>
+              <a
+                href="/admin"
+                className="inline-block mb-4 px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700"
+              >
+                → 관리자 페이지로 이동
+              </a>
+              <div>
+                <button
+                  onClick={handleLogout}
+                  className="text-sm text-blue-600 hover:underline"
+                >
+                  로그아웃
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="text-gray-600 text-sm mb-4">
+                관리자에게 샘플 배정을 요청하세요.
+              </p>
+              <button
+                onClick={handleLogout}
+                className="text-sm text-blue-600 hover:underline"
+              >
+                로그아웃
+              </button>
+            </>
+          )}
         </div>
       </div>
     );

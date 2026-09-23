@@ -16,30 +16,11 @@ export default function LoginPage() {
     e.preventDefault();
     setStatus({ kind: "sending" });
 
-    // 1) 먼저 whitelist 체크 (supabase RLS 밖에서 조회 가능하도록 anon key 사용)
     const supabase = createClient();
     const trimmedEmail = email.trim().toLowerCase();
 
-    const { data: allowed, error: checkError } = await supabase
-      .from("reviewers")
-      .select("email")
-      .eq("email", trimmedEmail)
-      .maybeSingle();
-
-    if (checkError) {
-      setStatus({ kind: "error", message: `조회 실패: ${checkError.message}` });
-      return;
-    }
-    if (!allowed) {
-      setStatus({
-        kind: "error",
-        message:
-          "등록되지 않은 이메일입니다. 관리자에게 등록 요청하세요.",
-      });
-      return;
-    }
-
-    // 2) 매직링크 발송
+    // 매직링크 발송. 유저가 처음이면 auth.users에 자동 생성되고,
+    // Supabase 트리거 on_auth_user_created 가 reviewers 테이블에도 자동 등록.
     const siteUrl =
       process.env.NEXT_PUBLIC_SITE_URL || window.location.origin;
     const { error } = await supabase.auth.signInWithOtp({
@@ -61,7 +42,7 @@ export default function LoginPage() {
       <div className="w-full max-w-md bg-white rounded-lg shadow p-8">
         <h1 className="text-2xl font-bold mb-2">GT Review Labeler</h1>
         <p className="text-gray-600 mb-6 text-sm">
-          등록된 이메일 주소로 로그인 링크를 보내드립니다.
+          이메일 주소로 로그인 링크를 보내드립니다.
         </p>
 
         {status.kind === "sent" ? (
